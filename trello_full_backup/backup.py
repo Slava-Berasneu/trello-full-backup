@@ -6,6 +6,7 @@ import re
 import datetime
 import requests
 import json
+from urllib.parse import quote
 
 # Do not download files over 100 MB by default
 ATTACHMENT_BYTE_LIMIT = 100000000
@@ -20,6 +21,33 @@ API_KEY = os.getenv('TRELLO_API_KEY', '')
 API_TOKEN = os.getenv('TRELLO_TOKEN', '')
 
 auth = '?key={}&token={}'.format(API_KEY, API_TOKEN)
+
+AUTH_HEADERS = {}
+if API_KEY and API_TOKEN:
+    AUTH_HEADERS = {
+        'Authorization': f'OAuth oauth_consumer_key="{API_KEY}", oauth_token="{API_TOKEN}"'
+    }
+
+def build_attachment_download_url(card, attachment):
+    '''Build a Trello /download/ URL for an attachment when possible.
+    Falls back to the raw attachment URL for non-Trello/external attachments.
+    '''
+    url = attachment.get('url', '')
+
+    if not (API_KEY and API_TOKEN):
+        return url
+    # If Trello already provides a /download/ URL, use that
+    if ('api.trello.com' in url or 'trello.com' in url) and '/download/' in url:
+        return url
+
+    card_id = card.get('id') if isinstance(card, dict) else None
+    att_id = attachment.get('id')
+
+    if card_id and att_id and ('trello.com' in url or 'api.trello.com' in url or 'amazonaws.com' in url):
+        filename = attachment.get('fileName') or attachment.get('name') or os.path.basename(url) or 'attachment'
+        filename_q = quote(filename, safe='')
+        return f"{API}cards/{card_id}/attachments/{att_id}/download/{filename_q}{auth}"
+    return url
 
 
 def mkdir(name):
@@ -87,18 +115,43 @@ def download_attachments(c, max_size, tokenize=False):
                 continue
 
             print('Saving attachment', attachment_name)
+            download_url = build_attachment_download_url(c, attachment)
+            content = None
             try:
-                content = requests.get(attachment['url'],
+                content = requests.get(download_url,
+                                       headers=AUTH_HEADERS,
                                        stream=True,
+                                       allow_redirects=True,
                                        timeout=ATTACHMENT_REQUEST_TIMEOUT)
-            except Exception:
-                sys.stderr.write('Failed download: {}'.format(attachment_name))
-                continue
+                content.raise_for_status()
+            except Exception as e:
+                # Fallback to the raw URL
+                raw_url = attachment.get('url')
+                if raw_url and raw_url != download_url:
+                    try:
+                        content = requests.get(raw_url,
+                                               headers=AUTH_HEADERS,
+                                               stream=True,
+                                               allow_redirects=True,
+                                               timeout=ATTACHMENT_REQUEST_TIMEOUT)
+                        content.raise_for_status()
+                    except Exception as e2:
+                        sys.stderr.write('Failed download: {} ({})\n'.format(attachment_name, str(e2)))
+                        continue
+                else:
+                    sys.stderr.write('Failed download: {} ({})\n'.format(attachment_name, str(e)))
+                    continue
 
-            with open(attachment_name, 'wb') as f:
-                for chunk in content.iter_content(chunk_size=1024):
-                    if chunk:
-                        f.write(chunk)
+            try:
+                with open(attachment_name, 'wb') as f:
+                    for chunk in content.iter_content(chunk_size=1024):
+                        if chunk:
+                            f.write(chunk)
+            finally:
+                try:
+                    content.close()
+                except Exception:
+                    pass
 
         # Exit attachments directory
         os.chdir('..')
